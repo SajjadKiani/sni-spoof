@@ -1,3 +1,5 @@
+//go:build !android
+
 // Go re-implementation of patterniha's SNI-Spoofing / DPI-bypass TCP forwarder.
 //
 // Linux: uses AF_PACKET raw sockets (requires CAP_NET_RAW / root).

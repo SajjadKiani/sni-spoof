@@ -1,29 +1,23 @@
 # sni-spoof
 
-Go port of [@patterniha](https://github.com/patterniha)'s SNI-Spoofing / DPI-bypass TCP forwarder — **his idea, all credit to him**. This is just a faithful reimplementation of the original Windows (WinDivert + Python) tool.
+Go port of [@patterniha](https://github.com/patterniha)'s SNI-Spoofing / DPI-bypass TCP forwarder.
 
-**Linux and macOS.** Linux uses `AF_PACKET` raw sockets (`CAP_NET_RAW` / root). macOS uses BPF via `/dev/bpf*` (needs root, or r/w access to a bpf device).
+The repo now has two paths:
 
-## How it works
+- Linux/macOS CLI forwarder (`main.go` + raw socket backends)
+- Android VPN engine (`engine.go` + `api.go`) exported with gomobile and consumed by `android-app/`
 
-A local TCP forwarder that tricks stateful DPI into whitelisting the flow before the real TLS ClientHello is sent:
+## Linux/macOS CLI usage
 
-1. Accept a client, dial the upstream, let the kernel do the TCP 3-way handshake normally.
-2. An `AF_PACKET` sniffer watches the handshake. It records the outbound SYN's ISN, and the instant it sees the outbound 3rd-handshake ACK it injects a crafted TLS ClientHello frame carrying an innocuous `FAKE_SNI` (e.g. `security.vercel.com`).
-3. The fake packet uses `seq = ISN + 1 - len(fake)` — i.e. a sequence number *before* the server's receive window. **DPI parses it and whitelists the connection; the server drops it as out-of-window.**
-4. The sniffer waits for the server's reply ACK with `ack == ISN + 1`, which proves the server ignored the fake and is still expecting the real byte stream. Only then does the forwarder start relaying real client↔server data. The real ClientHello is now invisible to DPI.
-5. If that confirmation doesn't arrive within 2s, the connection is aborted.
+Build and run:
 
-## Build / run
-
-```
+```bash
 go build -o sni-spoof .
 sudo ./sni-spoof config.json
 ```
 
-Works on Linux and macOS (amd64 / arm64). On macOS you may need to allow the binary to open `/dev/bpf*` — running under `sudo` is the simplest option.
-
 `config.json`:
+
 ```json
 {
   "LISTEN_HOST": "0.0.0.0",
@@ -34,4 +28,79 @@ Works on Linux and macOS (amd64 / arm64). On macOS you may need to allow the bin
 }
 ```
 
-Point your client (xray, etc.) at `LISTEN_HOST:LISTEN_PORT` instead of the real upstream.
+## Android architecture
+
+- `engine.go` (Android build tag) reads/writes raw IPv4/TCP packets from a TUN fd.
+- It tracks SYN ISN, injects fake TLS ClientHello with `seq = ISN + 1 - len(fake)` when outbound third ACK is seen, and waits up to 2s for confirmation `ACK == ISN + 1`.
+- Relay starts only after confirmation; timeout aborts flow.
+- `api.go` exports gomobile-friendly API:
+
+```go
+type VpnEngine interface {
+    Start(tunFd int, config string) error
+    Stop() error
+    Status() string
+}
+```
+
+Also exported as top-level functions for easy Kotlin calls:
+
+- `Start(tunFd, configJSON)`
+- `Stop()`
+- `Status()`
+
+## Build Android AAR with gomobile
+
+From module root (`/home/saji/sni-new/sni-spoof`):
+
+```bash
+go install golang.org/x/mobile/cmd/gomobile@latest
+go install golang.org/x/mobile/cmd/gobind@latest
+gomobile init
+gomobile bind -target android -o snispoof.aar .
+```
+
+Then copy AAR into Android app libs:
+
+```bash
+cp snispoof.aar android-app/app/libs/
+```
+
+## Android app project
+
+Files:
+
+- `android-app/app/src/main/java/com/snispoof/app/SniVpnService.kt`
+- `android-app/app/src/main/java/com/snispoof/app/MainActivity.kt`
+- `android-app/app/src/main/res/layout/activity_main.xml`
+- `android-app/app/src/main/AndroidManifest.xml`
+- `android-app/app/build.gradle`
+
+Gradle dependency already configured:
+
+```gradle
+implementation fileTree(dir: 'libs', include: ['*.aar'])
+```
+
+## Open and build in Android Studio
+
+1. Open Android Studio.
+2. Choose `Open` and select `/home/saji/sni-new/sni-spoof/android-app`.
+3. Let Gradle sync.
+4. Confirm `android-app/app/libs/snispoof.aar` exists.
+5. Build with `Build > Make Project`.
+
+## Install and test on device (API 26+)
+
+1. Enable developer mode + USB debugging on the Android device.
+2. Connect device and run app from Android Studio.
+3. In app UI, set:
+   - Listen Port
+   - Connect IP
+   - Connect Port
+   - Fake SNI
+4. Tap `START`.
+5. Accept Android VPN permission dialog.
+6. App starts `VpnService`, passes detached TUN fd to Go engine, and status should become `running`.
+7. Configure your local client to use `127.0.0.1:<LISTEN_PORT>` inside device context and verify traffic path.
+8. Tap `STOP` to tear down VPN + Go engine.
